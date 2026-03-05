@@ -1,0 +1,114 @@
+:root {
+  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  color: #1e293b;
+  background: radial-gradient(circle at top right, #dbeafe, #e2e8f0 55%, #f8fafc);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+.page {
+  max-width: 840px;
+  margin: 0 auto;
+  padding: 32px 16px 56px;
+}
+
+h1 {
+  margin: 0 0 6px;
+}
+
+p {
+  margin: 0;
+}
+
+.tabs {
+  display: flex;
+  gap: 8px;
+  margin: 18px 0;
+}
+
+.tab,
+.btn {
+  border: none;
+  border-radius: 10px;
+  padding: 10px 16px;
+  font-weight: 600;
+  cursor: pointer;
+  background: #dbeafe;
+  color: #0f172a;
+}
+
+.tab.active {
+  background: #1d4ed8;
+  color: #fff;
+}
+
+.card,
+.result {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid #cbd5e1;
+  border-radius: 14px;
+  padding: 16px;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 14px;
+}
+
+input[type="file"],
+input[type="number"] {
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  padding: 10px;
+  background: #fff;
+}
+
+.btn {
+  width: fit-content;
+  text-decoration: none;
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.player {
+  width: 100%;
+  border-radius: 10px;
+  background: #000;
+}
+
+.error {
+  margin-top: 14px;
+  color: #b91c1c;
+  font-weight: 600;
+}
+
+@media (max-width: 600px) {
+  .page {
+    padding-top: 20px;
+  }
+
+  .tab,
+  .btn {
+    width: 100%;
+  }
+
+  .tabs {
+    flex-direction: column;
+  }
+}
