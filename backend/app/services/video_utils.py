@@ -45,12 +45,16 @@ def encode_video_with_ffmpeg(frames_dir: Path, output_path: Path, fps: int, ffmp
         "-y",
         "-framerate",
         str(fps),
+        "-start_number",
+        "0",
         "-i",
         str(frames_dir / "frame_%06d.png"),
         "-c:v",
         "libx264",
         "-pix_fmt",
         "yuv420p",
+        "-movflags",
+        "+faststart",
         str(output_path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
