@@ -1,25 +1,47 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 from pathlib import Path
+from typing import Dict
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
+from sqlalchemy import text
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 
-from app.auth import create_access_token, get_current_user, hash_password, verify_password
-from app.config import FFMPEG_BIN, MODEL_DEVICE, OUTPUT_DIR, UPLOAD_DIR
-from app.database import Base, engine, get_db
-from app.models import Job, JobStatus, JobType, User
-from app.schemas import InterpolateResponse, JobResponse, LoginRequest, RegisterRequest, TokenResponse
-from app.services.frame_pipeline import generate_interpolated_sequence
-from app.services.model import FrameInterpolator, read_image_to_rgb_array
-from app.services.video_utils import encode_video_with_ffmpeg, extract_frames_from_video, save_frames_as_images
-from app.utils.fs import ensure_dir, new_id
+from .auth import create_access_token, get_current_user, hash_password, verify_password
+from .config import (
+    FFMPEG_BIN,
+    MODEL_BACKEND,
+    MODEL_DEVICE,
+    OUTPUT_DIR,
+    RIFE_MODEL_DIR,
+    RIFE_REPO_DIR,
+    RIFE_STRICT,
+    UPLOAD_DIR,
+)
+from .database import Base, engine, get_db
+from .models import FrameSession, FrameUpload, Job, JobStatus, JobType, User
+from .schemas import (
+    FrameSessionCreateResponse,
+    FrameSessionStatusResponse,
+    FrameUploadResponse,
+    InterpolateResponse,
+    JobResponse,
+    LoginRequest,
+    RegisterRequest,
+    TokenResponse,
+    UserResponse,
+)
+from .services.frame_pipeline import generate_interpolated_sequence
+from .services.model import FrameInterpolator, read_image_to_rgb_array
+from .services.video_utils import encode_video_with_ffmpeg, extract_frames_from_video, save_frames_as_images
+from .utils.fs import ensure_dir, new_id
 
-app = FastAPI(title="AI Video Frame Interpolation API", version="0.3.0")
+app = FastAPI(title="AI Video Frame Interpolation API", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,17 +53,54 @@ app.add_middleware(
 
 ensure_dir(UPLOAD_DIR)
 ensure_dir(OUTPUT_DIR)
-interpolator = FrameInterpolator(device=MODEL_DEVICE)
+interpolator = FrameInterpolator(
+    device=MODEL_DEVICE,
+    backend=MODEL_BACKEND,
+    rife_repo_dir=RIFE_REPO_DIR,
+    rife_model_dir=RIFE_MODEL_DIR,
+    strict=RIFE_STRICT,
+)
+if interpolator.warning:
+    print(interpolator.warning)
+print(f"Interpolation backend: {interpolator.backend}")
+
+# In-memory interpolation cache: maps cache_key -> output_video_id
+# cache_key = sha256(sorted frame content hashes + intermediate_count + fps)
+_interpolation_cache: Dict[str, str] = {}
 
 
 @app.on_event("startup")
 def startup() -> None:
     Base.metadata.create_all(bind=engine)
+    with engine.begin() as connection:
+        frame_session_columns = {
+            row[1]
+            for row in connection.execute(text("PRAGMA table_info(frame_sessions)")).fetchall()
+        }
+        if "user_id" not in frame_session_columns:
+            connection.execute(text("ALTER TABLE frame_sessions ADD COLUMN user_id INTEGER"))
+        frame_upload_columns = {
+            row[1]
+            for row in connection.execute(text("PRAGMA table_info(frame_uploads)")).fetchall()
+        }
+        if "content_hash" not in frame_upload_columns:
+            connection.execute(text("ALTER TABLE frame_uploads ADD COLUMN content_hash VARCHAR(64)"))
+        user_columns = {
+            row[1]
+            for row in connection.execute(text("PRAGMA table_info(users)")).fetchall()
+        }
+        if "name" not in user_columns:
+            connection.execute(text("ALTER TABLE users ADD COLUMN name VARCHAR(255)"))
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "backend": interpolator.backend}
+
+
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    return RedirectResponse(url="http://127.0.0.1:5173", status_code=307)
 
 
 @app.post("/api/auth/register", response_model=TokenResponse)
@@ -50,7 +109,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> TokenRe
     if exists:
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    user = User(email=payload.email, password_hash=hash_password(payload.password))
+    user = User(email=payload.email, name=payload.name, password_hash=hash_password(payload.password))
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -65,6 +124,11 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     return TokenResponse(access_token=create_access_token(user.id))
+
+
+@app.get("/api/auth/me", response_model=UserResponse)
+def me(current_user: User = Depends(get_current_user)) -> UserResponse:
+    return UserResponse.model_validate(current_user)
 
 
 def _job_to_response(job: Job) -> JobResponse:
@@ -136,6 +200,195 @@ def _run_job(job: Job, db: Session) -> None:
         raise
 
 
+@app.post("/api/public/frame-sessions", response_model=FrameSessionCreateResponse)
+def create_frame_session(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> FrameSessionCreateResponse:
+    session_id = new_id("session")
+    session = FrameSession(id=session_id, user_id=current_user.id)
+    db.add(session)
+    db.commit()
+    return FrameSessionCreateResponse(session_id=session_id)
+
+
+@app.post("/api/public/frame-sessions/{session_id}/frame", response_model=FrameUploadResponse)
+async def upload_frame_to_session(
+    session_id: str,
+    frame: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> FrameUploadResponse:
+    session = db.get(FrameSession, session_id)
+    if not session or session.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Frame session not found")
+
+    session_dir = ensure_dir(UPLOAD_DIR / session_id)
+    existing_count = db.query(FrameUpload).filter(FrameUpload.session_id == session_id).count()
+    original_name = frame.filename or "frame.png"
+    filename = f"{existing_count:04d}_{original_name}"
+    payload = await frame.read()
+    content_hash = hashlib.sha256(payload).hexdigest()
+
+    existing_upload = (
+        db.query(FrameUpload)
+        .join(FrameSession, FrameUpload.session_id == FrameSession.id)
+        .filter(
+            FrameSession.user_id == current_user.id,
+            FrameUpload.content_hash == content_hash,
+        )
+        .order_by(FrameUpload.created_at.desc())
+        .first()
+    )
+
+    reused_existing = existing_upload is not None and Path(existing_upload.file_path).exists()
+    if reused_existing:
+        save_path = Path(existing_upload.file_path)
+    else:
+        save_path = session_dir / filename
+        save_path.write_bytes(payload)
+
+    frame_row = FrameUpload(
+        session_id=session_id,
+        sequence_index=existing_count,
+        filename=filename,
+        file_path=str(save_path),
+        content_hash=content_hash,
+    )
+    db.add(frame_row)
+    db.commit()
+    db.refresh(frame_row)
+
+    total_frames = db.query(FrameUpload).filter(FrameUpload.session_id == session_id).count()
+    return FrameUploadResponse(
+        session_id=session_id,
+        frame_id=frame_row.id,
+        total_frames=total_frames,
+        reused_existing=reused_existing,
+    )
+
+
+@app.get("/api/public/frame-sessions/{session_id}", response_model=FrameSessionStatusResponse)
+def frame_session_status(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> FrameSessionStatusResponse:
+    session = db.get(FrameSession, session_id)
+    if not session or session.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Frame session not found")
+
+    frames = (
+        db.query(FrameUpload)
+        .filter(FrameUpload.session_id == session_id)
+        .order_by(FrameUpload.sequence_index.asc())
+        .all()
+    )
+
+    uploaded_frames_dir = str(UPLOAD_DIR / session_id)
+    generated_frames_dir = None
+    generated_frame_count = None
+    if session.output_video_id:
+        candidate_dir = OUTPUT_DIR / session.output_video_id / "frames"
+        if candidate_dir.exists():
+            generated_frames_dir = str(candidate_dir)
+            generated_frame_count = len(list(candidate_dir.glob("frame_*.png")))
+
+    return FrameSessionStatusResponse(
+        session_id=session_id,
+        total_frames=len(frames),
+        can_generate=len(frames) >= 2,
+        frame_names=[f.filename for f in frames],
+        generated_video_id=session.output_video_id,
+        uploaded_frames_dir=uploaded_frames_dir,
+        generated_frames_dir=generated_frames_dir,
+        generated_frame_count=generated_frame_count,
+    )
+
+
+@app.post("/api/public/frame-sessions/{session_id}/generate", response_model=InterpolateResponse)
+def generate_from_frame_session(
+    session_id: str,
+    intermediate_count: int = Form(7),
+    fps: int = Form(12),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> InterpolateResponse:
+    if intermediate_count < 1 or intermediate_count > 60:
+        raise HTTPException(status_code=400, detail="intermediate_count must be between 1 and 60")
+    if fps < 1 or fps > 120:
+        raise HTTPException(status_code=400, detail="fps must be between 1 and 120")
+
+    session = db.get(FrameSession, session_id)
+    if not session or session.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Frame session not found")
+
+    frames = (
+        db.query(FrameUpload)
+        .filter(FrameUpload.session_id == session_id)
+        .order_by(FrameUpload.sequence_index.asc())
+        .all()
+    )
+    if len(frames) < 2:
+        raise HTTPException(status_code=400, detail="Upload at least 2 frames before generating video")
+
+    # Build cache key from frame content hashes + params
+    frame_hashes = [f.content_hash or "" for f in frames]
+    cache_raw = "|".join(frame_hashes) + f"|ic={intermediate_count}|fps={fps}"
+    cache_key = hashlib.sha256(cache_raw.encode()).hexdigest()
+
+    # Check cache: if same frames+params were processed before, reuse the output
+    cached_video_id = _interpolation_cache.get(cache_key)
+    if cached_video_id:
+        cached_video = OUTPUT_DIR / cached_video_id / "smooth.mp4"
+        cached_frames_dir = OUTPUT_DIR / cached_video_id / "frames"
+        if cached_video.exists():
+            cached_frame_count = len(list(cached_frames_dir.glob("frame_*.png"))) if cached_frames_dir.exists() else 0
+            session.output_video_id = cached_video_id
+            db.commit()
+            return InterpolateResponse(
+                video_id=cached_video_id,
+                job_status=JobStatus.COMPLETED,
+                download_url=f"/api/download/{cached_video_id}",
+                total_frames=cached_frame_count,
+                fps=fps,
+                original_frame_count=len(frames),
+                generated_frame_count=cached_frame_count,
+                uploaded_frames_dir=str(UPLOAD_DIR / session_id),
+                generated_frames_dir=str(cached_frames_dir),
+            )
+
+    output_video_id = new_id("frames")
+    output_frames_dir = ensure_dir(OUTPUT_DIR / output_video_id / "frames")
+    output_video = OUTPUT_DIR / output_video_id / "smooth.mp4"
+
+    try:
+        source_frames = [read_image_to_rgb_array(f.file_path) for f in frames]
+        output_frames = generate_interpolated_sequence(source_frames, interpolator, intermediate_count)
+        save_frames_as_images(output_frames, output_frames_dir)
+        encode_video_with_ffmpeg(output_frames_dir, output_video, fps=fps, ffmpeg_bin=FFMPEG_BIN)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    # Store in cache
+    _interpolation_cache[cache_key] = output_video_id
+
+    session.output_video_id = output_video_id
+    db.commit()
+
+    return InterpolateResponse(
+        video_id=output_video_id,
+        job_status=JobStatus.COMPLETED,
+        download_url=f"/api/download/{output_video_id}",
+        total_frames=len(output_frames),
+        fps=fps,
+        original_frame_count=len(frames),
+        generated_frame_count=len(output_frames),
+        uploaded_frames_dir=str(UPLOAD_DIR / session_id),
+        generated_frames_dir=str(output_frames_dir),
+    )
+
+
 @app.post("/api/interpolate/images", response_model=InterpolateResponse)
 async def interpolate_from_images(
     first_image: UploadFile = File(...),
@@ -187,50 +440,10 @@ async def interpolate_from_images(
         download_url=f"/api/download/{job.id}" if job.status == JobStatus.COMPLETED else None,
         total_frames=job.total_frames,
         fps=job.fps,
-    )
-
-
-@app.post("/api/public/interpolate/frames", response_model=InterpolateResponse)
-async def interpolate_from_frames_public(
-    frames: list[UploadFile] = File(...),
-    intermediate_count: int = Form(3),
-    fps: int = Form(24),
-) -> InterpolateResponse:
-    if len(frames) < 2:
-        raise HTTPException(status_code=400, detail="Upload at least 2 frames.")
-    if intermediate_count < 1 or intermediate_count > 60:
-        raise HTTPException(status_code=400, detail="intermediate_count must be between 1 and 60")
-    if fps < 1 or fps > 120:
-        raise HTTPException(status_code=400, detail="fps must be between 1 and 120")
-
-    job_id = new_id("frames")
-    job_upload_dir = ensure_dir(UPLOAD_DIR / job_id)
-    job_frames_dir = ensure_dir(OUTPUT_DIR / job_id / "frames")
-    output_video = OUTPUT_DIR / job_id / "smooth.mp4"
-
-    sorted_frames = sorted(frames, key=lambda f: (f.filename or "").lower())
-    frame_paths: list[Path] = []
-
-    for idx, frame_file in enumerate(sorted_frames):
-        filename = frame_file.filename or f"frame_{idx:04d}.png"
-        save_path = job_upload_dir / filename
-        save_path.write_bytes(await frame_file.read())
-        frame_paths.append(save_path)
-
-    try:
-        source_frames = [read_image_to_rgb_array(str(path)) for path in frame_paths]
-        output_frames = generate_interpolated_sequence(source_frames, interpolator, intermediate_count)
-        save_frames_as_images(output_frames, job_frames_dir)
-        encode_video_with_ffmpeg(job_frames_dir, output_video, fps=fps, ffmpeg_bin=FFMPEG_BIN)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return InterpolateResponse(
-        video_id=job_id,
-        job_status=JobStatus.COMPLETED,
-        download_url=f"/api/download/{job_id}",
-        total_frames=len(output_frames),
-        fps=fps,
+        original_frame_count=2,
+        generated_frame_count=job.total_frames,
+        uploaded_frames_dir=str(job_upload_dir),
+        generated_frames_dir=str(OUTPUT_DIR / job.id / "frames") if job.total_frames else None,
     )
 
 
@@ -275,6 +488,9 @@ async def interpolate_from_video(
         download_url=f"/api/download/{job.id}" if job.status == JobStatus.COMPLETED else None,
         total_frames=job.total_frames,
         fps=job.fps,
+        generated_frame_count=job.total_frames,
+        uploaded_frames_dir=str(job_upload_dir),
+        generated_frames_dir=str(OUTPUT_DIR / job.id / "frames") if job.total_frames else None,
     )
 
 

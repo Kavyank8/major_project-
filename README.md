@@ -1,59 +1,17 @@
 # AI Video Frame Interpolation (React + FastAPI)
 
-This project implements the architecture you requested:
+React Frontend -> FastAPI Backend -> Interpolator (Optical Flow or RIFE) -> OpenCV + FFmpeg -> Smooth Video
 
-React Frontend
--> FastAPI Backend
--> PyTorch Frame Interpolation Model
--> OpenCV + FFmpeg
--> Generated Smooth Video
+## Current status
 
-## Workflows
+- Single-frame session workflow: upload frames one-by-one, store in DB, generate after minimum 2 frames
+- DB-backed frame sessions and frame uploads
+- Public frame-session APIs + existing auth/job APIs
+- Pluggable interpolation backend:
+  - `optical_flow` (default fallback)
+  - `rife` (real deep model, if repo + weights are available)
 
-### 1) Two Images to Smooth Video
-1. User uploads two frames.
-2. Backend loads the two images.
-3. PyTorch interpolation model generates intermediate frames.
-4. OpenCV writes frame sequence.
-5. FFmpeg encodes frames into MP4.
-6. User downloads smooth video.
-
-### 2) Video to Smoother Video
-1. User uploads a video.
-2. Backend extracts frames using OpenCV.
-3. Model generates intermediate frames between every adjacent pair.
-4. OpenCV writes output frame sequence.
-5. FFmpeg encodes smooth MP4.
-6. User downloads smooth video.
-
-## Project Structure
-
-```text
-backend/
-  app/
-    main.py
-    config.py
-    schemas.py
-    services/
-      model.py
-      frame_pipeline.py
-      video_utils.py
-    utils/
-      fs.py
-  requirements.txt
-  .env.example
-frontend/
-  src/
-    App.jsx
-    api.js
-    main.jsx
-    styles.css
-  package.json
-  vite.config.js
-README.md
-```
-
-## Backend Setup (FastAPI)
+## Backend setup
 
 ```powershell
 cd backend
@@ -63,11 +21,12 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
-Health check:
+Health endpoint now returns backend:
 
 - `GET http://127.0.0.1:8000/health`
+- Example: `{ "status": "ok", "backend": "rife" }`
 
-## Frontend Setup (React + Vite)
+## Frontend setup
 
 ```powershell
 cd frontend
@@ -75,45 +34,46 @@ npm install
 npm run dev
 ```
 
-Open:
+Open: `http://127.0.0.1:5173`
 
-- `http://127.0.0.1:5173`
+## One-by-one frame upload flow
 
-If backend is on another host/port, set:
+1. `POST /api/public/frame-sessions` -> create session
+2. `POST /api/public/frame-sessions/{session_id}/frame` -> upload one frame
+3. `GET /api/public/frame-sessions/{session_id}` -> check count (`can_generate` true when >= 2)
+4. `POST /api/public/frame-sessions/{session_id}/generate` -> generate final smooth video
+5. `GET /api/download/{video_id}` -> download result
 
-- `VITE_API_BASE=http://127.0.0.1:8000`
+## Enable real RIFE backend
 
-## API Endpoints
+By default, backend uses `optical_flow` so app runs without extra model files.
 
-### POST `/api/interpolate/images`
-Form fields:
-- `first_image`: file
-- `second_image`: file
-- `intermediate_count`: int (1-60)
-- `fps`: int (1-120)
+To enable RIFE:
 
-Returns:
-- `video_id`
-- `download_url`
-- `total_frames`
-- `fps`
+1. Clone RIFE repository under project root:
+```powershell
+cd "C:\Users\kkavy\Documents\New project"
+mkdir third_party -Force
+cd third_party
+git clone https://github.com/hzwer/ECCV2022-RIFE.git
+```
 
-### POST `/api/interpolate/video`
-Form fields:
-- `video_file`: file
-- `intermediate_count`: int (1-10)
+2. Place pretrained RIFE model files in:
+- `C:\Users\kkavy\Documents\New project\weights\rife`
 
-Returns same shape as above.
+3. Configure backend env (or set system env vars):
+- `MODEL_BACKEND=rife`
+- `RIFE_REPO_DIR=C:\Users\kkavy\Documents\New project\third_party\ECCV2022-RIFE`
+- `RIFE_MODEL_DIR=C:\Users\kkavy\Documents\New project\weights\rife`
+- `RIFE_STRICT=true` (optional: fail startup if RIFE unavailable)
 
-### GET `/api/download/{video_id}`
-Downloads the generated MP4.
+4. Restart backend and verify:
+- `GET /health` should show `"backend": "rife"`
 
-## Replacing Placeholder Model
-
-Current `backend/app/services/model.py` uses linear blend as a placeholder so the system runs end-to-end. Replace `FrameInterpolator.interpolate(...)` with your trained model inference (for example RIFE/FILM) while keeping the same method signature.
+If RIFE fails to load and `RIFE_STRICT=false`, backend automatically falls back to `optical_flow` and prints warning logs.
 
 ## Notes
 
-- FFmpeg must be installed and accessible in PATH.
-- Output videos are stored under `backend/storage/outputs/`.
-- Uploaded files are stored under `backend/storage/uploads/`.
+- FFmpeg must be available in PATH.
+- SQLite is used locally (`backend/app.db`).
+- For production: PostgreSQL + Redis worker queue recommended.

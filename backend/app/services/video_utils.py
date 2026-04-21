@@ -34,8 +34,12 @@ def extract_frames_from_video(video_path: Path) -> tuple[list[np.ndarray], int]:
 def save_frames_as_images(frames: list[np.ndarray], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     for idx, frame_rgb in enumerate(frames):
+        if frame_rgb.size == 0:
+            raise ValueError("Generated frame is empty and cannot be encoded.")
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(str(output_dir / f"frame_{idx:06d}.png"), frame_bgr)
+        ok = cv2.imwrite(str(output_dir / f"frame_{idx:06d}.png"), frame_bgr)
+        if not ok:
+            raise RuntimeError(f"Failed to write generated frame {idx}.")
 
 
 def encode_video_with_ffmpeg(frames_dir: Path, output_path: Path, fps: int, ffmpeg_bin: str = "ffmpeg") -> None:
@@ -49,8 +53,14 @@ def encode_video_with_ffmpeg(frames_dir: Path, output_path: Path, fps: int, ffmp
         "0",
         "-i",
         str(frames_dir / "frame_%06d.png"),
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
         "-c:v",
         "libx264",
+        "-crf",
+        "18",
+        "-preset",
+        "fast",
         "-pix_fmt",
         "yuv420p",
         "-movflags",

@@ -5,16 +5,39 @@ from typing import List
 import cv2
 import numpy as np
 
-from app.services.model import FrameInterpolator
+from .model import FrameInterpolator
 
 
-def resize_match(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    if a.shape[:2] == b.shape[:2]:
-        return a, b
+def ensure_even_dimensions(frame: np.ndarray) -> np.ndarray:
+    """libx264/yuv420p requires even frame dimensions."""
+    height, width = frame.shape[:2]
+    even_height = height if height % 2 == 0 else height - 1
+    even_width = width if width % 2 == 0 else width - 1
 
-    h = min(a.shape[0], b.shape[0])
-    w = min(a.shape[1], b.shape[1])
-    return cv2.resize(a, (w, h)), cv2.resize(b, (w, h))
+    if even_height < 2 or even_width < 2:
+        raise ValueError("Frame dimensions must be at least 2x2 pixels.")
+
+    if (even_height, even_width) == (height, width):
+        return frame
+
+    return frame[:even_height, :even_width]
+
+
+def normalize_frame_sizes(source_frames: list[np.ndarray]) -> list[np.ndarray]:
+    """Resize all frames to the first frame size for stable interpolation/encoding."""
+    base_frame = ensure_even_dimensions(source_frames[0])
+    base_h, base_w = base_frame.shape[:2]
+    normalized: list[np.ndarray] = []
+
+    for frame in source_frames:
+        even_frame = ensure_even_dimensions(frame)
+        if even_frame.shape[:2] == (base_h, base_w):
+            normalized.append(even_frame)
+        else:
+            resized = cv2.resize(even_frame, (base_w, base_h), interpolation=cv2.INTER_CUBIC)
+            normalized.append(ensure_even_dimensions(resized))
+
+    return normalized
 
 
 def generate_interpolated_sequence(
@@ -27,16 +50,18 @@ def generate_interpolated_sequence(
     if len(source_frames) < 2:
         raise ValueError("Need at least two source frames")
 
+    source_frames = normalize_frame_sizes(source_frames)
     output: List[np.ndarray] = []
 
     for i in range(len(source_frames) - 1):
-        first, second = resize_match(source_frames[i], source_frames[i + 1])
+        first = source_frames[i]
+        second = source_frames[i + 1]
         output.append(first)
 
         for step in range(1, intermediate_count + 1):
             t = step / (intermediate_count + 1)
-            middle = interpolator.interpolate(first, second, t)
+            middle = ensure_even_dimensions(interpolator.interpolate(first, second, t))
             output.append(middle)
 
-    output.append(source_frames[-1])
+    output.append(ensure_even_dimensions(source_frames[-1]))
     return output
